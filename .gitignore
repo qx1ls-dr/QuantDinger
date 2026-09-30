@@ -82,6 +82,8 @@ _tmp_*.txt
 _i18n_*.txt
 backend_api_python/logs/
 backend_api_python/dist/
+# JEV demo trader decision logs and replay-check answer cache
+jev_*.jsonl
 
 # Local engineering notes, acceptance evidence, and generated audit reports.
 # Product and contributor documentation belongs in the repository-level docs/ tree.
