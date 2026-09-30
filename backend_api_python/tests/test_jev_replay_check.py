@@ -63,11 +63,22 @@ class FakeJev:
     def __call__(self, url, headers=None, json=None, timeout=None):
         self.urls.append(url)
         self.requests.append(json)
-        bullish = json["state"]["timeframes"]["4h"]["ema20_vs_ema50_pct"] > 0
+        spread = json["state"]["timeframes"]["4h"]["ema20_vs_ema50_pct"]
+        if "regime" in json["questions"]:
+            trending = abs(spread) > 1.0
+            probabilities = {"trend": 0.7, "range": 0.3} if trending else {"trend": 0.3, "range": 0.7}
+            return FakeHttpResponse({"answers": {"regime": {"choice": "trend" if trending else "range",
+                                                            "probabilities": probabilities, "confidence": 0.7}}})
+        bullish = spread > 0
         probabilities = {"long": 0.7, "flat": 0.3} if bullish else {"long": 0.3, "flat": 0.7}
         choice = "long" if bullish else "flat"
         return FakeHttpResponse({"answers": {"position": {"choice": choice, "probabilities": probabilities,
                                                           "confidence": 0.7}}})
+
+
+def decision_of(choice, confidence):
+    other = "range" if choice == "trend" else "trend"
+    return jt.Decision(choice, confidence, {choice: 0.8, other: 0.2})
 
 
 def decision(choice="long", confidence=0.8):
@@ -159,11 +170,21 @@ def test_trend_target_follows_the_dual_moving_average_template():
 
 def test_cache_key_changes_with_question_model_and_state():
     _, _, snaps = load(bars=200)
-    key = rc.cache_key("BTC/USDT", 240, snaps[0], ("long", "flat"), "jev-latest")
+    long_flat = jt.build_questions(("long", "flat"))
+    key = rc.cache_key("BTC/USDT", 240, snaps[0], long_flat, "jev-latest")
     assert key.startswith(f"BTCUSDT|240|{snaps[0].ts_ms}|")
-    assert key != rc.cache_key("BTC/USDT", 240, snaps[0], ("long", "flat", "short"), "jev-latest")
-    assert key != rc.cache_key("BTC/USDT", 240, snaps[0], ("long", "flat"), "jev-2")
-    assert key != rc.cache_key("BTC/USDT", 240, snaps[1], ("long", "flat"), "jev-latest")
+    assert key != rc.cache_key("BTC/USDT", 240, snaps[0], jt.build_questions(("long", "flat", "short")), "jev-latest")
+    assert key != rc.cache_key("BTC/USDT", 240, snaps[0], rc.REGIME_QUESTIONS, "jev-latest")
+    assert key != rc.cache_key("BTC/USDT", 240, snaps[0], long_flat, "jev-2")
+    assert key != rc.cache_key("BTC/USDT", 240, snaps[1], long_flat, "jev-latest")
+
+
+def test_position_question_keeps_the_cache_keys_of_earlier_runs():
+    _, _, snaps = load(bars=200)
+    name, options, questions = rc.jev_question("position", allow_short=False)
+    assert (name, options) == ("position", ("long", "flat"))
+    assert questions == jt.build_questions(("long", "flat"))
+    assert rc.jev_question("regime", allow_short=False)[:2] == ("regime", ("trend", "range"))
 
 
 # ---------------------------------------------------------------- strategies and scoring
@@ -250,6 +271,45 @@ def test_verdict_falls_back_to_the_trend_or_to_nothing():
     assert "do not trade" in rc.verdict_lines(nothing, 0.5, 500, 240)[-1]
 
 
+def test_regime_gate_follows_confident_answers():
+    answers = [None, decision_of("trend", 0.7), decision_of("range", 0.4), decision_of("range", 0.7)]
+    gates = rc.regime_gates(answers, 0.6)
+    assert gates == [0, 1, 1, 0]
+    assert rc.gated([1, 1, -1, 1], gates) == [0, 1, -1, 0]
+
+
+def test_a_perfect_regime_filter_beats_random_filters():
+    rng = random.Random(5)
+    returns = [rng.gauss(0.0, 0.01) for _ in range(400)]
+    trend = [1] * 400
+    gates = [1 if r > 0 else 0 for r in returns]
+    actual = rc.evaluate(rc.gated(trend, gates), returns, 0.0).net_return
+    shifted = rc.random_gate_timing(trend, gates, returns, 0.0, random.Random(2), draws=200)
+    assert rc.timing_percentile([actual], [[r.net_return for r in shifted]]) > 0.99
+    assert rc.random_gate_timing(trend, [1] * 400, returns, 0.0, random.Random(2)) == []
+
+
+def test_profile_spots_dip_buying():
+    dip = {"rsi14": 30.0, "chg_6_bars_pct": -3.0, "close_vs_ema50_pct": -4.0, "ema20_vs_ema50_pct": -1.0}
+    calm = {"rsi14": 50.0, "chg_6_bars_pct": 0.5, "close_vs_ema50_pct": 1.0, "ema20_vs_ema50_pct": 0.5}
+    rows = [(decision_of("long", 0.7), dip, -0.01)] * 30 + [(decision_of("long", 0.7), calm, 0.01)] * 10
+    rows += [(decision_of("flat", 0.7), calm, 0.0)] * 50
+    text = "\n".join(rc.profile_lines(rows, ("long", "flat"), "4h"))
+    long_row = next(line for line in text.splitlines() if line.strip().startswith("long "))
+    assert long_row.split() == ["long", "40", "35.0", "-2.12%", "-2.75%", "-0.62%"]
+    assert "30 of 40 (75%), right 0%; above it: 10, right 100%" in text
+    assert "Jev mostly buys dips" in text
+
+
+def test_regime_verdict():
+    good = {"BTC/USDT": {rc.TREND: 0.1, rc.TREND_REGIME: 0.2}, "ETH/USDT": {rc.TREND: 0.1, rc.TREND_REGIME: 0.15}}
+    lines = rc.regime_verdict_lines(good, 0.97, 3000)
+    assert "PASSED" in lines[1] and "demo account" in lines[-1]
+    assert "not proven" in rc.regime_verdict_lines(good, 0.8, 3000)[1]
+    worse = {"BTC/USDT": {rc.TREND: 0.1, rc.TREND_REGIME: 0.05}, "ETH/USDT": {rc.TREND: 0.1, rc.TREND_REGIME: 0.2}}
+    assert "stop using Jev" in rc.regime_verdict_lines(worse, 0.97, 3000)[-1]
+
+
 # ---------------------------------------------------------------- asking Jev
 
 
@@ -325,11 +385,26 @@ def test_main_compares_jev_with_simple_rules_and_reuses_the_cache(tmp_path, caps
     for frame in sent["state"]["timeframes"].values():
         assert "last_close" not in frame and "last_candle_close_time" not in frame
     assert set(sent["questions"]["position"]["criteria"]) == {"long", "flat"}
+    assert "What the 4h candle looked like when Jev answered" in out
 
     again = FakeJev()
     assert rc.main(argv, env={"JEV_API_KEY": "k"}, get=FakeKlines(), post=again, now=lambda: NOW_MS / 1000) == 0
     assert again.requests == []
     assert "Jev answers: 0 new, 500 from cache" in capsys.readouterr().out
+
+
+def test_main_regime_question_filters_the_trend(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(rc, "RANDOM_SHIFTS", 50)
+    argv = ["--bars", "250", "--question", "regime", "--cache", str(tmp_path / "cache.jsonl")]
+    jev = FakeJev()
+    assert rc.main(argv, env={"JEV_API_KEY": "k"}, get=FakeKlines(), post=jev, now=lambda: NOW_MS / 1000) == 0
+    out = capsys.readouterr().out
+    for text in ("Jev asked: trend or range", rc.TREND_REGIME, rc.RANDOM_GATE, 'When Jev said "trend"',
+                 'When Jev said "range"', "Jev as a trend/range filter", "Next step"):
+        assert text in out
+    assert rc.JEV not in out
+    assert set(jev.requests[0]["questions"]) == {"regime"}
+    assert set(jev.requests[0]["questions"]["regime"]["criteria"]) == {"trend", "range"}
 
 
 def test_main_without_a_jev_key_shows_only_the_simple_rules(capsys):

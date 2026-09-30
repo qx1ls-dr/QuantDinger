@@ -296,17 +296,19 @@ def build_questions(options: Sequence[str]) -> Dict[str, Any]:
     }
 
 
-def parse_jev_answer(payload: Any, options: Sequence[str]) -> Tuple[str, Dict[str, float], float]:
+def parse_jev_answer(
+    payload: Any, options: Sequence[str], question: str = "position"
+) -> Tuple[str, Dict[str, float], float]:
     """Validate a Jev choice answer with the same rules as the platform's AI decision filter."""
     if not isinstance(payload, dict):
         raise JevError("response_not_an_object")
     answers = payload.get("answers") or payload.get("result") or payload.get("data") or {}
-    answer = answers.get("position") if isinstance(answers, dict) else None
+    answer = answers.get(question) if isinstance(answers, dict) else None
     if not isinstance(answer, dict) and isinstance(answers, dict):
         nested = answers.get("answers")
-        answer = nested.get("position") if isinstance(nested, dict) else None
+        answer = nested.get(question) if isinstance(nested, dict) else None
     if not isinstance(answer, dict):
-        raise JevError("position_answer_missing")
+        raise JevError(f"{question}_answer_missing")
     allowed = set(options)
     choice = str(answer.get("choice") or answer.get("selected") or "").strip().lower()
     if choice not in allowed:
@@ -337,6 +339,8 @@ def ask_jev(
     model: str,
     timeout: float,
     post: Callable[..., Any] = requests.post,
+    questions: Optional[Mapping[str, Any]] = None,
+    question: str = "position",
 ) -> Decision:
     url = base_url.strip().rstrip("/")
     if not url.endswith("/systemone"):
@@ -345,11 +349,11 @@ def ask_jev(
     response = post(
         url,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": model, "state": state, "questions": build_questions(options)},
+        json={"model": model, "state": state, "questions": questions or build_questions(options)},
         timeout=max(1.0, min(float(timeout), 30.0)),
     )
     response.raise_for_status()
-    choice, probabilities, confidence = parse_jev_answer(response.json(), options)
+    choice, probabilities, confidence = parse_jev_answer(response.json(), options, question)
     return Decision(choice, confidence, probabilities, int((time.perf_counter() - started) * 1000))
 
 

@@ -136,6 +136,14 @@ def test_parse_jev_answer_rejects_unusable_answers(payload):
         jt.parse_jev_answer(payload, ("long", "flat", "short"))
 
 
+def test_parse_jev_answer_reads_a_named_question():
+    payload = {"answers": {"regime": {"choice": "trend", "probabilities": {"trend": 0.7, "range": 0.3},
+                                      "confidence": 0.7}}}
+    assert jt.parse_jev_answer(payload, ("trend", "range"), "regime")[0] == "trend"
+    with pytest.raises(jt.JevError, match="regime_answer_missing"):
+        jt.parse_jev_answer(answer(), ("trend", "range"), "regime")
+
+
 def test_parse_jev_answer_rejects_short_when_shorting_is_off():
     with pytest.raises(jt.JevError):
         jt.parse_jev_answer(answer(choice="short", probabilities={"long": 0.1, "flat": 0.1, "short": 0.8}),

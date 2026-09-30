@@ -15,12 +15,20 @@ no funding) it compares:
   - trend + jev: the trend gives the direction, Jev decides when to enter, exits follow the trend;
   - random timing: Jev's own positions shifted in time (same trades and time in market).
 
+With --question regime Jev is asked a different question instead: is the market trending or
+ranging? The trend rule then trades only while Jev says "trend", and is compared with the plain
+trend rule and with the same filter switched on at random times.
+
+In the default mode the report also shows what the candles looked like when Jev chose long,
+for example whether it mostly bought after drops.
+
 Market data comes from Bybit's public API (no keys needed). Jev answers are cached, so a re-run
 with other fees or thresholds costs nothing. Without JEV_API_KEY only the simple rules are shown.
 
 Examples:
   python scripts/jev_replay_check.py                           # BTC and ETH, 4h, 1500 candles each
   python scripts/jev_replay_check.py --interval 60 --bars 3000
+  python scripts/jev_replay_check.py --question regime          # Jev as a trend/range filter
 """
 
 from __future__ import annotations
@@ -66,6 +74,30 @@ TREND = "trend (SMA 20/60)"
 JEV = "jev decides"
 TREND_JEV = "trend + jev entry"
 RANDOM = "random timing (median)"
+TREND_REGIME = "trend + jev regime"
+RANDOM_GATE = "random regime (median)"
+
+REGIME_OPTIONS = ("trend", "range")
+REGIME_QUESTIONS = {
+    "regime": {
+        "type": "choice",
+        "instructions": (
+            "Using only the supplied point-in-time market evidence, judge whether price is likely to keep "
+            "moving persistently in one direction over the next several candles, or to chop sideways."
+        ),
+        "criteria": {
+            "trend": "Price is likely to keep moving in one direction, so trend-following entries should work.",
+            "range": "Price is likely to chop sideways or reverse, so trend-following entries would be whipsawed.",
+        },
+    }
+}
+# Main-timeframe features shown when profiling Jev's answers: (key, column title, suffix).
+PROFILE_FEATURES = (
+    ("rsi14", "rsi14", ""),
+    ("chg_6_bars_pct", "6-candle chg", "%"),
+    ("close_vs_ema50_pct", "vs EMA50", "%"),
+    ("ema20_vs_ema50_pct", "EMA20 vs 50", "%"),
+)
 
 
 @dataclass(frozen=True)
@@ -206,8 +238,18 @@ def build_snapshots(
 # --------------------------------------------------------------------------- asking Jev
 
 
-def cache_key(symbol: str, interval_min: int, snapshot: Snapshot, options: Sequence[str], model: str) -> str:
-    request = {"state": snapshot.state, "questions": jt.build_questions(options), "model": model}
+def jev_question(kind: str, allow_short: bool) -> Tuple[str, Tuple[str, ...], Dict[str, Any]]:
+    """(question name, answer options, question definition) for --question."""
+    if kind == "regime":
+        return "regime", REGIME_OPTIONS, REGIME_QUESTIONS
+    options = ("long", "flat", "short") if allow_short else ("long", "flat")
+    return "position", options, jt.build_questions(options)
+
+
+def cache_key(
+    symbol: str, interval_min: int, snapshot: Snapshot, questions: Mapping[str, Any], model: str
+) -> str:
+    request = {"state": snapshot.state, "questions": questions, "model": model}
     digest = hashlib.sha1(json.dumps(request, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return f"{bybit_symbol(symbol)}|{interval_min}|{snapshot.ts_ms}|{digest}"
 
@@ -359,6 +401,41 @@ def evaluate(positions: Sequence[int], returns: Sequence[float], cost: float) ->
     return Result(equity - 1.0, max_drop, trades, fees, held / len(returns) if returns else 0.0)
 
 
+def regime_gates(decisions: Sequence[Optional[jt.Decision]], min_confidence: float) -> List[int]:
+    """1 while Jev's last confident answer was "trend", else 0."""
+    gate, out = 0, []
+    for decision in decisions:
+        if decision is not None and decision.confidence >= min_confidence:
+            gate = 1 if decision.choice == "trend" else 0
+        out.append(gate)
+    return out
+
+
+def gated(trend: Sequence[int], gates: Sequence[int]) -> List[int]:
+    return [target * gate for target, gate in zip(trend, gates)]
+
+
+def random_gate_timing(
+    trend: Sequence[int],
+    gates: Sequence[int],
+    returns: Sequence[float],
+    cost: float,
+    rng: random.Random,
+    draws: Optional[int] = None,
+) -> List[Result]:
+    """The same regime filter switched on at random times (same share of time on)."""
+    draws = RANDOM_SHIFTS if draws is None else draws
+    gates = list(gates)
+    n = len(gates)
+    if n < 2 or len(set(gates)) < 2:
+        return []
+    results = []
+    for _ in range(draws):
+        k = rng.randrange(1, n)
+        results.append(evaluate(gated(trend, gates[k:] + gates[:k]), returns, cost))
+    return results
+
+
 def random_timing(
     positions: Sequence[int],
     returns: Sequence[float],
@@ -426,6 +503,71 @@ def hit_stats(pairs: Sequence[Tuple[Optional[jt.Decision], float]]) -> HitStats:
         baseline=(longs * up + (n - longs) * down) / n if n else 0.0,
         buckets=tuple(buckets),
     )
+
+
+def profile_lines(
+    rows: Sequence[Tuple[jt.Decision, Mapping[str, Any], float]],
+    options: Sequence[str],
+    label: str,
+) -> List[str]:
+    """Average main-timeframe features per answer, and whether long answers were dip buying."""
+    lines = [f"What the {label} candle looked like when Jev answered (averages):"]
+    header = f"  {'answer':<8}{'count':>7}" + "".join(f"{title:>15}" for _, title, _ in PROFILE_FEATURES)
+    lines.append(header)
+    for option in options:
+        group = [features for decision, features, _ in rows if decision.choice == option]
+        if not group:
+            continue
+        cells = []
+        for key, _, suffix in PROFILE_FEATURES:
+            values = [float(f[key]) for f in group if f.get(key) is not None]
+            mean = statistics.fmean(values) if values else None
+            text = "-" if mean is None else (f"{mean:+.2f}{suffix}" if suffix else f"{mean:.1f}")
+            cells.append(f"{text:>15}")
+        lines.append(f"  {option:<8}{len(group):>7}" + "".join(cells))
+    longs = [(features, ret) for decision, features, ret in rows if decision.choice == "long"]
+    below = [ret for features, ret in longs if (features.get("close_vs_ema50_pct") or 0.0) < 0]
+    above = [ret for features, ret in longs if (features.get("close_vs_ema50_pct") or 0.0) >= 0]
+    if longs:
+        def right(rets: Sequence[float]) -> str:
+            return f"right {sum(1 for r in rets if r > 0) / len(rets):.0%}" if rets else "none"
+
+        lines.append(
+            f"  Long answers with price below its 50-candle average: {len(below)} of {len(longs)} "
+            f"({len(below) / len(longs):.0%}), {right(below)}; above it: {len(above)}, {right(above)}."
+        )
+        if len(longs) >= 20 and len(below) / len(longs) >= 0.6:
+            lines.append("  -> Jev mostly buys dips: it goes long after prices fell below their average.")
+        elif len(longs) >= 20 and len(below) / len(longs) <= 0.4:
+            lines.append("  -> Jev mostly buys strength: it goes long when prices are above their average.")
+    return lines
+
+
+def regime_verdict_lines(
+    net: Mapping[str, Mapping[str, float]],
+    percentile: Optional[float],
+    answers: int,
+) -> List[str]:
+    symbols = list(net)
+    wins = sum(1 for s in symbols if net[s][TREND_REGIME] > net[s][TREND])
+    enough = answers >= MIN_DIRECTIONAL_ANSWERS
+    passed = enough and wins == len(symbols) and percentile is not None and percentile >= PASS_PERCENTILE
+    lines = [
+        "Verdict",
+        f"  Jev as a trend/range filter: {'PASSED' if passed else 'not proven'} "
+        f"(better than plain trend on {wins} of {len(symbols)} symbols; "
+        f"needs all of them and {PASS_PERCENTILE:.0%} of random filters)",
+    ]
+    if not enough:
+        lines.append(f"  Too few Jev answers ({answers}) for a firm answer: add --bars or --symbols.")
+    if passed:
+        step = "test the trend strategy with the Jev regime filter on the demo account"
+    elif statistics.fmean(net[s][TREND] for s in symbols) > 0:
+        step = "trade the plain trend strategy (Dual Moving Average template); stop using Jev for trade decisions"
+    else:
+        step = "do not trade any of these yet: even the trend rule lost money on this data"
+    lines.append(f"  Next step: {step}.")
+    return lines
 
 
 # --------------------------------------------------------------------------- report
@@ -496,32 +638,54 @@ def report_lines(
     allow_short: bool,
     cost: float,
     rng: random.Random,
+    question: str = "position",
 ) -> List[str]:
+    regime = question == "regime"
     sides = "long, flat or short" if allow_short else "long or flat only"
+    asked = "Jev asked: trend or range" if regime else "Jev asked: which position"
+    label = jt.interval_label(interval_min)
     lines = [
-        f"JEV replay check | {jt.interval_label(interval_min)} candles | {sides} | cost {cost * 100:.3f}% per side "
+        f"JEV replay check | {label} candles | {sides} | {asked} | cost {cost * 100:.3f}% per side "
         "(fee + slippage) | full-account position, no leverage, stops or funding",
         "",
     ]
     net: Dict[str, Dict[str, float]] = {}
-    actual_jev: List[float] = []
+    actual: List[float] = []
     random_runs: List[Optional[List[float]]] = []
     pairs: List[Tuple[Optional[jt.Decision], float]] = []
+    profile_rows: List[Tuple[jt.Decision, Mapping[str, Any], float]] = []
+    trend_by_answer: Dict[str, List[float]] = {}
     for symbol, snaps in snapshots.items():
         returns = [snap.ret for snap in snaps]
         trend = [snap.trend for snap in snaps]
         results = {BUY_HOLD: evaluate([1] * len(snaps), returns, cost), TREND: evaluate(trend, returns, cost)}
         if decisions is not None:
             answers = decisions[symbol]
-            positions = jev_positions(answers, min_confidence)
-            results[JEV] = evaluate(positions, returns, cost)
-            results[TREND_JEV] = evaluate(trend_jev_positions(trend, answers, min_confidence), returns, cost)
-            shifted = random_timing(positions, returns, cost, rng)
-            if shifted:
-                results[RANDOM] = median_result(shifted)
-            actual_jev.append(results[JEV].net_return)
+            if regime:
+                gates = regime_gates(answers, min_confidence)
+                results[TREND_REGIME] = evaluate(gated(trend, gates), returns, cost)
+                shifted = random_gate_timing(trend, gates, returns, cost, rng)
+                if shifted:
+                    results[RANDOM_GATE] = median_result(shifted)
+                actual.append(results[TREND_REGIME].net_return)
+                for answer, target, ret in zip(answers, trend, returns):
+                    if answer is not None:
+                        trend_by_answer.setdefault(answer.choice, []).append(target * ret)
+            else:
+                positions = jev_positions(answers, min_confidence)
+                results[JEV] = evaluate(positions, returns, cost)
+                results[TREND_JEV] = evaluate(trend_jev_positions(trend, answers, min_confidence), returns, cost)
+                shifted = random_timing(positions, returns, cost, rng)
+                if shifted:
+                    results[RANDOM] = median_result(shifted)
+                actual.append(results[JEV].net_return)
+                pairs.extend(zip(answers, returns))
+                profile_rows.extend(
+                    (answer, snap.state["timeframes"][label], snap.ret)
+                    for answer, snap in zip(answers, snaps)
+                    if answer is not None
+                )
             random_runs.append([r.net_return for r in shifted] if shifted else None)
-            pairs.extend(zip(answers, returns))
         net[symbol] = {name: result.net_return for name, result in results.items()}
         lines.append(f"{symbol}: {len(snaps)} candles, {day(snaps[0].ts_ms)} .. {day(snaps[-1].ts_ms)}")
         lines.extend(format_table(results))
@@ -536,28 +700,52 @@ def report_lines(
         f"{stats.invalid} invalid, {stats.failed} failed"
     )
     lines.append(stats_line + (f" (last error: {stats.last_error})" if stats.last_error else ""))
-    hits = hit_stats(pairs)
-    if hits.answers:
-        rate = hits.hits / hits.answers
-        margin = math.sqrt(rate * (1.0 - rate) / hits.answers)
-        lines.append(
-            f"Jev direction right: {rate:.1%} ± {margin:.1%} of {hits.answers} long/short answers "
-            f"(the same answers at random candles: {hits.baseline:.1%})"
-        )
-        by_confidence = ", ".join(f"{label} {wins / n:.0%} (n={n})" for label, wins, n in hits.buckets if n)
-        lines.append(f"  by confidence: {by_confidence}")
+    percentile = timing_percentile(actual, random_runs)
+
+    if regime:
+        for choice in REGIME_OPTIONS:
+            values = trend_by_answer.get(choice, [])
+            if values:
+                lines.append(
+                    f'When Jev said "{choice}", the trend rule made {statistics.fmean(values) * 100:+.3f}% '
+                    f"per candle before fees (n={len(values)})."
+                )
+        if percentile is None:
+            lines.append("Jev never changed its answer, so the filter cannot be tested.")
+        else:
+            lines.append(
+                f"Jev's filter beats {percentile:.0%} of the same filter switched on at random times "
+                f"(needs {PASS_PERCENTILE:.0%})."
+            )
+        lines.append("")
+        answered = sum(len(values) for values in trend_by_answer.values())
+        lines.extend(regime_verdict_lines(net, percentile, answered))
     else:
-        lines.append("Jev never chose long or short.")
-    percentile = timing_percentile(actual_jev, random_runs)
-    if percentile is None:
-        lines.append("Jev never changed position, so its timing cannot be tested.")
-    else:
-        lines.append(
-            f"Jev timing beats {percentile:.0%} of random timings with the same trades "
-            f"(needs {PASS_PERCENTILE:.0%})."
-        )
-    lines.append("")
-    lines.extend(verdict_lines(net, percentile, hits.answers, interval_min))
+        hits = hit_stats(pairs)
+        if hits.answers:
+            rate = hits.hits / hits.answers
+            margin = math.sqrt(rate * (1.0 - rate) / hits.answers)
+            lines.append(
+                f"Jev direction right: {rate:.1%} ± {margin:.1%} of {hits.answers} long/short answers "
+                f"(the same answers at random candles: {hits.baseline:.1%})"
+            )
+            by_confidence = ", ".join(f"{name} {wins / n:.0%} (n={n})" for name, wins, n in hits.buckets if n)
+            lines.append(f"  by confidence: {by_confidence}")
+        else:
+            lines.append("Jev never chose long or short.")
+        if percentile is None:
+            lines.append("Jev never changed position, so its timing cannot be tested.")
+        else:
+            lines.append(
+                f"Jev timing beats {percentile:.0%} of random timings with the same trades "
+                f"(needs {PASS_PERCENTILE:.0%})."
+            )
+        if profile_rows:
+            lines.append("")
+            options = ("long", "flat", "short") if allow_short else ("long", "flat")
+            lines.extend(profile_lines(profile_rows, options, label))
+        lines.append("")
+        lines.extend(verdict_lines(net, percentile, hits.answers, interval_min))
     lines.append("")
     lines.append("Past data only; Jev saw no symbol, dates or prices. Funding, stops and cool-downs are not modelled.")
     return lines
@@ -571,6 +759,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--symbols", default="BTC/USDT,ETH/USDT", help="comma-separated Bybit USDT perpetuals")
     parser.add_argument("--interval", type=int, default=240, help=f"candle minutes {jt.INTERVALS_MIN}")
     parser.add_argument("--bars", type=int, default=1500, help="candles per symbol to test")
+    parser.add_argument(
+        "--question",
+        choices=("position", "regime"),
+        default="position",
+        help="position: Jev picks the position; regime: Jev says trend or range and filters the trend rule",
+    )
     parser.add_argument("--allow-short", action="store_true", help="let Jev and the trend rule go short")
     parser.add_argument("--min-confidence", type=float, default=jt.Config().min_confidence)
     parser.add_argument("--fee", type=float, default=0.00055, help="per side (Bybit taker 0.055%%)")
@@ -630,16 +824,16 @@ def load_snapshots(
 def ask_jev_about(
     snapshots: Mapping[str, Sequence[Snapshot]],
     args: argparse.Namespace,
-    options: Sequence[str],
     env: Mapping[str, str],
     *,
     post: Callable[..., Any],
 ) -> Tuple[Dict[str, List[Optional[jt.Decision]]], AskStats]:
+    name, options, questions = jev_question(args.question, args.allow_short)
     settings = jt.jev_settings(env)
     cache_path = Path(args.cache)
     cache = load_cache(cache_path)
     keys = {
-        symbol: [cache_key(symbol, args.interval, snap, options, settings["model"]) for snap in snaps]
+        symbol: [cache_key(symbol, args.interval, snap, questions, settings["model"]) for snap in snaps]
         for symbol, snaps in snapshots.items()
     }
     jobs = [(key, snap.state) for symbol, snaps in snapshots.items() for key, snap in zip(keys[symbol], snaps)]
@@ -647,7 +841,7 @@ def ask_jev_about(
     print(f"Asking Jev about {len(jobs)} candles ({cached} already cached)...", file=sys.stderr, flush=True)
     stats = collect_answers(
         jobs,
-        lambda state: jt.ask_jev(state, options=options, post=post, **settings),
+        lambda state: jt.ask_jev(state, options=options, post=post, questions=questions, question=name, **settings),
         cache=cache,
         cache_path=cache_path,
         workers=args.workers,
@@ -670,7 +864,6 @@ def main(
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    options = ("long", "flat", "short") if args.allow_short else ("long", "flat")
     try:
         snapshots = load_snapshots(symbols, args, get=get, now_ms=int(now() * 1000))
     except (requests.RequestException, RuntimeError, ValueError) as exc:
@@ -680,7 +873,7 @@ def main(
     decisions: Optional[Dict[str, List[Optional[jt.Decision]]]] = None
     stats: Optional[AskStats] = None
     if str(env.get("JEV_API_KEY") or "").strip():
-        decisions, stats = ask_jev_about(snapshots, args, options, env, post=post)
+        decisions, stats = ask_jev_about(snapshots, args, env, post=post)
     lines = report_lines(
         snapshots,
         decisions,
@@ -690,6 +883,7 @@ def main(
         allow_short=args.allow_short,
         cost=args.fee + args.slippage,
         rng=random.Random(RANDOM_SEED),
+        question=args.question,
     )
     print("\n".join(lines))
     return 0
